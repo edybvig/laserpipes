@@ -1,9 +1,10 @@
 import type { Conductor, ConductorState, EntityChannel, Pulse } from './types';
 
 // Real Formula 1 telemetry via the free OpenF1 API (api.openf1.org).
-// Live during race weekends; otherwise a time-accelerated replay of the most
-// recent race. One laser per driver in team color: speed drives growth,
-// throttle drives brightness, braking forces turns, DRS fires pulses.
+// Replays a selected race (or the most recent) time-accelerated; live during
+// race weekends when OpenF1's free tier allows it. One pipe per driver in team
+// color: speed drives growth, throttle drives brightness, braking forces
+// turns, DRS fires pulses.
 
 const API = 'https://api.openf1.org/v1';
 const REPLAY_SPEED = 12;
@@ -21,7 +22,6 @@ interface CarSample {
 interface DriverTrack {
   number: number;
   acronym: string;
-  color: [number, number, number];
   samples: CarSample[];
   cursor: number;
   drsOpen: boolean;
@@ -29,12 +29,36 @@ interface DriverTrack {
 
 export type F1Status = 'loading' | 'ready' | 'error';
 
+export interface RaceOption {
+  sessionKey: number;
+  label: string;
+}
+
+/** What the setup panel needs to render one driver row. */
+export interface DriverInfo {
+  number: number;
+  acronym: string;
+  fullName: string;
+  /** Three presets derived from the team color: base / light / deep. */
+  variants: [number, number, number][];
+}
+
+export interface F1Prefs {
+  sessionKey?: number;
+  /** Driver numbers to exclude. */
+  excluded: number[];
+  /** Driver numbers rendered bold (max 3). */
+  highlights: number[];
+  /** driverNumber → variant index (0–2). */
+  variants: Record<string, number>;
+}
+
 function hexToRgb(hex: string | null): [number, number, number] {
   if (!hex || !/^[0-9a-fA-F]{6}$/.test(hex)) return [0.8, 0.8, 0.85];
   let r = parseInt(hex.slice(0, 2), 16) / 255;
   let g = parseInt(hex.slice(2, 4), 16) / 255;
   let b = parseInt(hex.slice(4, 6), 16) / 255;
-  // Lift very dark team colors so they still read as lasers.
+  // Lift very dark team colors so they still read against the void.
   const max = Math.max(r, g, b);
   if (max < 0.45 && max > 0) {
     const lift = 0.55 / max;
@@ -45,14 +69,51 @@ function hexToRgb(hex: string | null): [number, number, number] {
   return [r, g, b];
 }
 
+function colorVariants(base: [number, number, number]): [number, number, number][] {
+  const light: [number, number, number] = [
+    base[0] + (1 - base[0]) * 0.55,
+    base[1] + (1 - base[1]) * 0.55,
+    base[2] + (1 - base[2]) * 0.55,
+  ];
+  const deep: [number, number, number] = [base[0] * 0.55, base[1] * 0.55, base[2] * 0.55];
+  return [base, light, deep];
+}
+
 const DRS_OPEN = new Set([10, 12, 14]);
+
+/** Past races (and sprints) available to replay, newest first. */
+export async function listRaces(): Promise<RaceOption[]> {
+  const year = new Date().getFullYear();
+  const fetchYear = async (y: number) => {
+    const res = await fetch(`${API}/sessions?year=${y}`);
+    if (!res.ok) throw new Error(`OpenF1 ${res.status}`);
+    return (await res.json()) as any[];
+  };
+  const sessions = [...(await fetchYear(year)), ...(await fetchYear(year - 1).catch(() => []))];
+  const now = Date.now();
+  return sessions
+    .filter(
+      (s) =>
+        (s.session_name === 'Race' || s.session_name === 'Sprint') && Date.parse(s.date_end) < now,
+    )
+    .sort((a, b) => Date.parse(b.date_start) - Date.parse(a.date_start))
+    .slice(0, 40)
+    .map((s) => ({
+      sessionKey: s.session_key,
+      label: `${s.country_name ?? s.circuit_short_name} ${s.session_name === 'Sprint' ? 'Sprint' : 'GP'} ${s.year}`,
+    }));
+}
 
 export class F1Conductor implements Conductor {
   private drivers = new Map<number, DriverTrack>();
+  private driverList: DriverInfo[] = [];
   private entities: EntityChannel[] = [];
+  private entityDrivers: number[] = []; // driver number per entity index
   private pulseQueue: Pulse[] = [];
   private disposed = false;
   private abort = new AbortController();
+  private prefs: F1Prefs;
+  private entitiesDirty = true;
 
   private live = false;
   private sessionKey = 0;
@@ -67,7 +128,11 @@ export class F1Conductor implements Conductor {
   private status: F1Status = 'loading';
   private statusMessage = 'Connecting to OpenF1…';
 
-  constructor(private onStatus: (status: F1Status, message: string) => void) {
+  constructor(
+    private onStatus: (status: F1Status, message: string) => void,
+    prefs?: Partial<F1Prefs>,
+  ) {
+    this.prefs = { excluded: [], highlights: [], variants: {}, ...prefs };
     this.init().catch((err) => {
       if (this.disposed) return;
       this.status = 'error';
@@ -81,6 +146,19 @@ export class F1Conductor implements Conductor {
             : 'OpenF1 unavailable';
       this.onStatus('error', this.statusMessage);
     });
+  }
+
+  getDrivers(): DriverInfo[] {
+    return this.driverList;
+  }
+
+  getPrefs(): F1Prefs {
+    return this.prefs;
+  }
+
+  setPrefs(prefs: Partial<F1Prefs>): void {
+    this.prefs = { ...this.prefs, ...prefs };
+    this.entitiesDirty = true;
   }
 
   private async get<T>(path: string): Promise<T> {
@@ -97,17 +175,27 @@ export class F1Conductor implements Conductor {
     sessions.sort((a, b) => Date.parse(a.date_start) - Date.parse(b.date_start));
 
     const now = Date.now();
+    let session: any;
+    if (this.prefs.sessionKey) {
+      session = sessions.find((s) => s.session_key === this.prefs.sessionKey);
+      if (!session) {
+        const extra = await this.get<any[]>(`/sessions?session_key=${this.prefs.sessionKey}`);
+        session = extra[0];
+      }
+    }
     const liveSession = sessions.find(
       (s) => Date.parse(s.date_start) <= now && now <= Date.parse(s.date_end) + 5 * 60_000,
     );
-    let session = liveSession;
     if (!session) {
-      const past = sessions.filter((s) => Date.parse(s.date_end) < now);
-      session = past.filter((s) => s.session_name === 'Race').pop() ?? past.pop();
+      session = liveSession;
+      if (!session) {
+        const past = sessions.filter((s) => Date.parse(s.date_end) < now);
+        session = past.filter((s) => s.session_name === 'Race').pop() ?? past.pop();
+      }
     }
     if (!session) throw new Error('No usable F1 session');
 
-    this.live = !!liveSession;
+    this.live = !!liveSession && session.session_key === liveSession.session_key;
     this.sessionKey = session.session_key;
     this.sessionStart = Date.parse(session.date_start);
     this.sessionEnd = Date.parse(session.date_end);
@@ -119,29 +207,36 @@ export class F1Conductor implements Conductor {
       this.drivers.set(d.driver_number, {
         number: d.driver_number,
         acronym: d.name_acronym ?? `#${d.driver_number}`,
-        color: hexToRgb(d.team_colour),
         samples: [],
         cursor: 0,
         drsOpen: false,
       });
-      this.entities.push({
-        id: `d${d.driver_number}`,
-        color: hexToRgb(d.team_colour),
-        fieldMix: 0.12,
-        intensity: 0.6,
-        speed: 1,
-        turnBias: 0.2,
-        branchChance: 0,
-        label: d.name_acronym,
+      this.driverList.push({
+        number: d.driver_number,
+        acronym: d.name_acronym ?? `#${d.driver_number}`,
+        fullName: d.full_name ?? d.broadcast_name ?? `Driver ${d.driver_number}`,
+        variants: colorVariants(hexToRgb(d.team_colour)),
       });
     }
+    // Teammates share a color: give the second driver of each team the light
+    // variant by default so both are identifiable out of the box.
+    const seenTeams = new Map<string, number>();
+    for (const d of drivers) {
+      const team = d.team_name ?? d.team_colour ?? '?';
+      const count = seenTeams.get(team) ?? 0;
+      seenTeams.set(team, count + 1);
+      if (count > 0 && this.prefs.variants[d.driver_number] === undefined) {
+        this.prefs.variants[d.driver_number] = 1;
+      }
+    }
+    this.entitiesDirty = true;
 
     if (this.live) {
       this.playhead = now - 15_000; // OpenF1 realtime data lags a few seconds
       this.fetchedUntil = this.playhead;
     } else {
       // Skip pre-race idling: start a few minutes into the session.
-      this.playhead = Date.parse(session.date_start) + 6 * 60_000;
+      this.playhead = this.sessionStart + 6 * 60_000;
       this.fetchedUntil = this.playhead;
       await this.fetchWindow();
     }
@@ -150,6 +245,30 @@ export class F1Conductor implements Conductor {
     this.status = 'ready';
     this.statusMessage = this.live ? 'LIVE' : `REPLAY ${REPLAY_SPEED}×`;
     this.onStatus('ready', this.statusMessage);
+  }
+
+  private rebuildEntities(): void {
+    this.entities = [];
+    this.entityDrivers = [];
+    const excluded = new Set(this.prefs.excluded);
+    const highlights = new Set(this.prefs.highlights);
+    for (const info of this.driverList) {
+      if (excluded.has(info.number)) continue;
+      const variant = Math.min(2, this.prefs.variants[info.number] ?? 0);
+      this.entities.push({
+        id: `d${info.number}`,
+        color: info.variants[variant],
+        fieldMix: 0,
+        intensity: 0.6,
+        speed: 1,
+        turnBias: 0.2,
+        branchChance: 0,
+        bold: highlights.has(info.number),
+        label: info.acronym,
+      });
+      this.entityDrivers.push(info.number);
+    }
+    this.entitiesDirty = false;
   }
 
   private ingest(rows: any[]): void {
@@ -237,6 +356,7 @@ export class F1Conductor implements Conductor {
         caption: this.status === 'loading' ? 'CONNECTING TO OPENF1…' : this.statusMessage,
       };
     }
+    if (this.entitiesDirty) this.rebuildEntities();
 
     if (this.live) {
       this.playhead += dt * 1000;
@@ -266,7 +386,7 @@ export class F1Conductor implements Conductor {
     let energyCount = 0;
     for (let i = 0; i < this.entities.length; i++) {
       const entity = this.entities[i];
-      const track = this.drivers.get(parseInt(entity.id.slice(1), 10))!;
+      const track = this.drivers.get(this.entityDrivers[i])!;
       const sample = this.sampleAt(track, this.playhead);
       if (!sample) {
         entity.speed = 0.15;
@@ -293,8 +413,7 @@ export class F1Conductor implements Conductor {
       entities: this.entities,
       pulses,
       lockEntityCount: true,
-      // A deep ambient field so team colors stay dominant.
-      colorAt: (_x, _y, _z, t) => [0.25 + 0.1 * Math.sin(t * 0.2), 0.3, 0.9],
+      colorAt: () => [0.3, 0.35, 0.9],
       caption: `F1 ${this.statusMessage} · ${this.sessionLabel}`.toUpperCase(),
     };
   }

@@ -15,6 +15,8 @@ export interface EntityChannel {
   turnBias: number;
   /** Probability of spawning a branch at each step, 0–1. */
   branchChance: number;
+  /** Render this entity's pipes thicker (highlighted driver). */
+  bold?: boolean;
   label?: string;
 }
 

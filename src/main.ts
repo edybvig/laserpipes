@@ -3,9 +3,10 @@ import { PipeSim } from './engine/pipeSim';
 import { LaserRenderer, detectQuality } from './engine/laserRenderer';
 import { CameraRig } from './engine/camera';
 import { NeuralConductor } from './conductor/neural';
-import { F1Conductor } from './conductor/f1';
+import { F1Conductor, listRaces, type F1Prefs } from './conductor/f1';
 import { MicOverlay } from './conductor/audio';
 import { Controls, showToast, type Mode } from './ui/controls';
+import { F1Panel } from './ui/f1Panel';
 import type { Conductor } from './conductor/types';
 
 const canvas = document.getElementById('stage') as HTMLCanvasElement;
@@ -19,27 +20,52 @@ const mic = new MicOverlay();
 
 let conductor: Conductor = new NeuralConductor();
 
+function makeF1Conductor(prefs: F1Prefs): F1Conductor {
+  return new F1Conductor((status, message) => {
+    if (status === 'error') {
+      showToast(`${message} — back to Neural mode`, 6000);
+      controls.reflectMode('neural');
+      switchMode('neural');
+    } else if (status === 'ready') {
+      const f1 = conductor as F1Conductor;
+      panel.setDrivers(f1.getDrivers(), f1.getPrefs());
+      showToast(`OpenF1 connected · ${message}`);
+    }
+  }, prefs);
+}
+
 function switchMode(mode: Mode): void {
   conductor.dispose?.();
   if (mode === 'f1') {
-    conductor = new F1Conductor((status, message) => {
-      if (status === 'error') {
-        showToast(`${message} — back to Neural mode`, 6000);
-        controls.reflectMode('neural');
-        conductor.dispose?.();
-        conductor = new NeuralConductor();
-      } else if (status === 'ready') {
-        showToast(`OpenF1 connected · ${message}`);
-      }
-    });
+    if (mic.active) {
+      mic.disable();
+      controls.setMicActive(false);
+    }
+    renderer.setStyle('solid');
+    sim.hueShift = 0;
+    conductor = makeF1Conductor(controls.settings.f1);
   } else {
+    renderer.setStyle('laser');
+    panel.hide();
     conductor = new NeuralConductor();
+    apply();
   }
+}
+
+function restart(): void {
+  renderer.clearAll();
+  sim.resetAll();
+  conductor.dispose?.();
+  conductor =
+    controls.settings.mode === 'f1'
+      ? makeF1Conductor(controls.settings.f1)
+      : new NeuralConductor();
 }
 
 const controls = new Controls({
   onMode: switchMode,
   onMicToggle: async () => {
+    if (controls.settings.mode === 'f1') return false;
     if (mic.active) {
       mic.disable();
       return false;
@@ -54,13 +80,32 @@ const controls = new Controls({
     }
   },
   onChange: apply,
+  onRefresh: restart,
+  onF1Setup: () => (panel.visible ? panel.hide() : panel.show()),
+});
+
+const panel = new F1Panel({
+  loadRaces: listRaces,
+  onPrefsChange: (prefs) => {
+    controls.settings.f1 = { ...controls.settings.f1, ...prefs };
+    controls.persist();
+    if (!(conductor instanceof F1Conductor)) return;
+    if (prefs.sessionKey !== undefined) {
+      // New race: full restart with a fresh conductor.
+      restart();
+    } else {
+      conductor.setPrefs(prefs);
+      sim.resetPipes(); // entity list changed; respawn pipes against it
+      panel.setDrivers(conductor.getDrivers(), conductor.getPrefs());
+    }
+  },
 });
 
 function apply(): void {
   const s = controls.settings;
   sim.baseRate = 2 + s.speed * 9;
   sim.targetPipes = Math.round(2 + s.density * 16);
-  sim.hueShift = s.colorMood;
+  sim.hueShift = s.mode === 'f1' ? 0 : s.colorMood;
   renderer.setGlow(s.glow);
 }
 apply();
@@ -74,7 +119,7 @@ function tick(dt: number): void {
   simTime += dt;
   const state = conductor.update(dt, simTime);
 
-  // Mic overlay layers onto whatever the conductor produced.
+  // Mic overlay layers onto the neural conductor only.
   let energy = state.energy;
   if (mic.active) {
     const audio = mic.update(dt);

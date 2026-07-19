@@ -78,7 +78,7 @@ class SegmentPool {
     }
   }
 
-  push(seg: Segment): void {
+  push(seg: Segment, gainBase: number): void {
     const i = this.head;
     if (this.tokens[i] >= 0) this.onEvict(this.tokens[i]);
     this.tokens[i] = seg.cellToken;
@@ -92,28 +92,51 @@ class SegmentPool {
     else if (Math.abs(dy) > 0.5) dirIdx = dy > 0 ? 2 : 3;
     else dirIdx = dz > 0 ? 4 : 5;
 
+    const radius = TUBE_RADIUS * (seg.bold ? 2.3 : 1);
     this.tmpPos.set(seg.from[0] + dx / 2, seg.from[1] + dy / 2, seg.from[2] + dz / 2);
-    this.tmpScale.set(TUBE_RADIUS, len + TUBE_RADIUS, TUBE_RADIUS);
+    this.tmpScale.set(radius, len + radius, radius);
     this.tmpMat.compose(this.tmpPos, this.dirQuats[dirIdx], this.tmpScale);
     this.tubes.setMatrixAt(i, this.tmpMat);
 
     this.tmpPos.set(seg.to[0], seg.to[1], seg.to[2]);
-    this.tmpScale.setScalar(TUBE_RADIUS * 1.6);
+    this.tmpScale.setScalar(radius * 1.6);
     this.tmpMat.compose(this.tmpPos, new THREE.Quaternion(), this.tmpScale);
     this.joints.setMatrixAt(i, this.tmpMat);
 
-    const gain = 0.45 + seg.intensity * 0.95; // slight overdrive feeds the bloom
+    const gain = (gainBase + seg.intensity * 0.95) * (seg.bold ? 1.25 : 1);
     this.baseColors[i * 3] = seg.color[0] * gain;
     this.baseColors[i * 3 + 1] = seg.color[1] * gain;
     this.baseColors[i * 3 + 2] = seg.color[2] * gain;
     this.tmpColor.setRGB(this.baseColors[i * 3], this.baseColors[i * 3 + 1], this.baseColors[i * 3 + 2]);
     this.tubes.setColorAt(i, this.tmpColor);
-    this.joints.setColorAt(i, this.tmpColor.multiplyScalar(0.6));
+    this.joints.setColorAt(i, this.tmpColor.multiplyScalar(0.85));
 
     this.head = (i + 1) % this.capacity;
     this.used = Math.min(this.used + 1, this.capacity);
     this.tubes.instanceMatrix.needsUpdate = true;
     this.joints.instanceMatrix.needsUpdate = true;
+    // Without this, fresh segments render black until the fade loop's first
+    // flush — the original "moving dots with no pipes" startup bug.
+    this.tubes.instanceColor!.needsUpdate = true;
+    this.joints.instanceColor!.needsUpdate = true;
+  }
+
+  clear(): void {
+    const zero = new THREE.Matrix4().makeScale(0, 0, 0);
+    for (let i = 0; i < this.capacity; i++) {
+      this.tubes.setMatrixAt(i, zero);
+      this.joints.setMatrixAt(i, zero);
+      this.tokens[i] = -1;
+    }
+    this.baseColors.fill(0);
+    (this.tubes.instanceColor!.array as Float32Array).fill(0);
+    (this.joints.instanceColor!.array as Float32Array).fill(0);
+    this.head = 0;
+    this.used = 0;
+    this.tubes.instanceMatrix.needsUpdate = true;
+    this.joints.instanceMatrix.needsUpdate = true;
+    this.tubes.instanceColor!.needsUpdate = true;
+    this.joints.instanceColor!.needsUpdate = true;
   }
 
   /** Dim the oldest slots so the sculpture perpetually dissolves behind itself. */
@@ -154,6 +177,8 @@ function makeGlowTexture(): THREE.Texture {
   return tex;
 }
 
+export type RenderStyle = 'laser' | 'solid';
+
 export class LaserRenderer {
   readonly renderer: THREE.WebGLRenderer;
   readonly scene: THREE.Scene;
@@ -164,6 +189,8 @@ export class LaserRenderer {
   private material: THREE.MeshBasicMaterial;
   private headSprites: THREE.Sprite[] = [];
   private glowTex: THREE.Texture;
+  private style: RenderStyle = 'laser';
+  private glowSetting = 0.55;
   /** Transient global flash (pulses), decays each frame. */
   private pulseLevel = 0;
 
@@ -207,17 +234,44 @@ export class LaserRenderer {
     });
     this.composer.addPass(new EffectPass(this.camera, this.bloom));
 
+    this.applyStyle();
     this.resize();
   }
 
   addSegment(seg: Segment): void {
-    this.pool.push(seg);
+    // Solid style pushes base gain up so opaque pipes read fully saturated.
+    this.pool.push(seg, this.style === 'solid' ? 0.75 : 0.45);
   }
 
-  /** Glow slider: 0–1 → bloom + exposure. */
+  clearAll(): void {
+    this.pool.clear();
+  }
+
+  /** Glow slider: 0–1 → bloom + exposure. Ignored in solid style (no glow). */
   setGlow(glow: number): void {
-    this.bloom.intensity = 0.3 + glow * 2.0;
-    this.renderer.toneMappingExposure = 0.85 + glow * 0.45;
+    this.glowSetting = glow;
+    this.applyStyle();
+  }
+
+  /** laser = additive + bloom (neural); solid = opaque, no glow (F1). */
+  setStyle(style: RenderStyle): void {
+    this.style = style;
+    this.applyStyle();
+  }
+
+  private applyStyle(): void {
+    if (this.style === 'solid') {
+      this.material.blending = THREE.NormalBlending;
+      this.material.depthWrite = true;
+      this.bloom.intensity = 0;
+      this.renderer.toneMappingExposure = 1.05;
+    } else {
+      this.material.blending = THREE.AdditiveBlending;
+      this.material.depthWrite = false;
+      this.bloom.intensity = 0.3 + this.glowSetting * 2.0;
+      this.renderer.toneMappingExposure = 0.85 + this.glowSetting * 0.45;
+    }
+    this.material.needsUpdate = true;
   }
 
   firePulse(strength: number): void {
@@ -246,14 +300,15 @@ export class LaserRenderer {
       }
       sprite.visible = true;
       sprite.position.set(head.pos[0], head.pos[1], head.pos[2]);
-      const s = 0.5 + head.intensity * 0.65 + this.pulseLevel * 0.6;
+      const solid = this.style === 'solid';
+      const s = (0.5 + head.intensity * 0.65 + this.pulseLevel * 0.6) * (solid ? 0.7 : 1);
       sprite.scale.setScalar(s);
       (sprite.material as THREE.SpriteMaterial).color.setRGB(
         head.color[0] * (0.9 + energy * 0.6),
         head.color[1] * (0.9 + energy * 0.6),
         head.color[2] * (0.9 + energy * 0.6),
       );
-      (sprite.material as THREE.SpriteMaterial).opacity = 0.4 + 0.4 * head.intensity;
+      (sprite.material as THREE.SpriteMaterial).opacity = (0.4 + 0.4 * head.intensity) * (solid ? 0.6 : 1);
     }
   }
 

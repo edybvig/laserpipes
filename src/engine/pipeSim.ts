@@ -15,6 +15,8 @@ export interface Segment {
   to: [number, number, number];
   color: [number, number, number];
   intensity: number;
+  /** Render thicker (highlighted entity). */
+  bold: boolean;
   /** Opaque token the renderer hands back when this segment is evicted. */
   cellToken: number;
 }
@@ -79,6 +81,17 @@ export class PipeSim {
 
   freeCell(token: number): void {
     if (token >= 0 && token < this.occupancy.length) this.occupancy[token] = 0;
+  }
+
+  /** Kill living pipes (structure keeps dissolving); new ones respawn next tick. */
+  resetPipes(): void {
+    this.pipes.length = 0;
+  }
+
+  /** Full restart: no pipes, empty grid. */
+  resetAll(): void {
+    this.pipes.length = 0;
+    this.occupancy.fill(0);
   }
 
   private isFree(cx: number, cy: number, cz: number): boolean {
@@ -175,7 +188,7 @@ export class PipeSim {
     ]);
     pipe.lastColor = color;
     pipe.lastIntensity = channel.intensity;
-    this.emit({ from, to, color, intensity: channel.intensity, cellToken: token });
+    this.emit({ from, to, color, intensity: channel.intensity, bold: !!channel.bold, cellToken: token });
 
     // Occasional branch: hand off a perpendicular start to a fresh pipe.
     if (this.pipes.length < MAX_PIPES && Math.random() < channel.branchChance) {
